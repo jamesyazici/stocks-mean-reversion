@@ -1,44 +1,67 @@
 from datetime import datetime, timezone, timedelta
 import pandas as pd
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, TOTAL_BARS, BAR_TIMEFRAME_MINUTES
+import yfinance as yf
+from config import TOTAL_BARS, BAR_TIMEFRAME_MINUTES
+from logger import get_logger
 
-# Single shared data client (no auth required for market data on free tier,
-# but providing keys enables higher rate limits)
-_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+log = get_logger(__name__)
 
 
 def fetch_bars(symbol: str, n_bars: int = TOTAL_BARS) -> pd.DataFrame:
-    """Fetch the most recent n_bars 1-minute bars for a symbol.
+    """Fetch the most recent n_bars 1-minute bars for a symbol using yfinance.
 
-    Returns a DataFrame with columns: open, high, low, close, volume,
-    indexed by timestamp. Returns empty DataFrame on failure.
+    Returns a DataFrame with lowercase columns (open, high, low, close, volume)
+    indexed by timestamp. Returns an empty DataFrame on failure.
     """
-    # Request a window large enough to guarantee n_bars of trading minutes
+    # 5 calendar days is enough to collect 90 trading minutes even across weekends
     end = datetime.now(timezone.utc)
-    # Add extra calendar buffer to account for weekends/holidays
     start = end - timedelta(days=5)
 
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame(BAR_TIMEFRAME_MINUTES, TimeFrameUnit.Minute),
-        start=start,
-        end=end,
-        limit=n_bars,
-    )
+    interval = f"{BAR_TIMEFRAME_MINUTES}m"
 
-    bars = _data_client.get_stock_bars(request)
-    df = bars.df
+    try:
+        df = yf.download(
+            tickers=symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            progress=False,
+            auto_adjust=True,  # adjusts for splits/dividends automatically
+        )
+    except Exception as e:
+        log.error(f"{symbol} | yfinance download failed: {e}", exc_info=True)
+        return pd.DataFrame()
 
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        log.warning(f"{symbol} | yfinance returned no data.")
+        return pd.DataFrame()
 
-    # When fetching a single symbol the index is (symbol, timestamp);
-    # drop the symbol level so callers get a flat timestamp index.
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level="symbol")
+    # yfinance returns MultiIndex columns when auto_adjust=True in some versions;
+    # flatten to a single level and lowercase all column names.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [c.lower() for c in df.columns]
 
-    # Keep only the most recent n_bars rows
+    # Ensure the required column is present after normalisation
+    if "close" not in df.columns:
+        log.warning(f"{symbol} | 'close' column missing after normalisation. Columns: {list(df.columns)}")
+        return pd.DataFrame()
+
     return df.tail(n_bars)
+
+
+def fetch_latest_price(symbol: str) -> float | None:
+    """Return the latest traded price for a symbol using yfinance fast_info.
+
+    Returns None if the price cannot be retrieved.
+    """
+    try:
+        info = yf.Ticker(symbol).fast_info
+        price = info.last_price
+        if price is None or price != price:  # catch None and NaN
+            log.warning(f"{symbol} | fast_info returned no valid price.")
+            return None
+        return float(price)
+    except Exception as e:
+        log.error(f"{symbol} | fast_info lookup failed: {e}", exc_info=True)
+        return None
